@@ -1,100 +1,176 @@
 #include <stdint.h>
 
-// special crap (which is nyi)
+#include "asm_basics.hpp"
+#include "uart_x_out.hpp"
+
+#include "limine.h"
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexcessive-regsave"
+
+// special crap
+
+// limine use rev 2
+__attribute__((used, section(".limine_requests")))
+static volatile LIMINE_BASE_REVISION(2);
+
+uint8_t stack[1024];
+
+// -
+struct InterruptFrame {
+    uint64_t ip;     // instruction ptr
+    uint64_t cs;     // code segment
+    uint64_t flags;  // cpu state
+    uint64_t sp;     // stack ptr
+    uint64_t ss;     // stack seg
+};
+
+typedef struct {
+    uint16_t limit; // size of idt -1
+    uint64_t base;  // raw idt
+} __attribute__((packed)) idtr_t;
+
+
+typedef struct {
+    uint16_t    isr_low;      // The lower 16 bits of the ISR's address
+    uint16_t    kernel_cs;    // The GDT segment selector that the CPU will load into CS before calling the ISR
+    uint8_t	    ist;          // The IST in the TSS that the CPU will load into RSP
+    uint8_t     attributes;   // Type and attributes; see the IDT page
+    uint16_t    isr_mid;      // The higher 16 bits of the lower 32 bits of the ISR's address
+    uint32_t    isr_high;     // The higher 32 bits of the ISR's address
+    uint32_t    reserved;     // Set to zero
+} __attribute__((packed)) idt_entry_t;
+
+/////
+
+
 
 //// -~# DRIVERS #~- ////
-/// -# asm drivers
-
-    // disables interrupts
-    // mildly dangerous if you dont know what you're doing, but not as dangerous as halt() because you can undo it
-    static inline void disable_interrupts() {
-
-        __asm__ ("cli" : : : "memory" );
-
-    }
 
 
-    // enables interrupts
-    // probably not dangerous, just know what you're doing
-    static inline void enable_interrupts() {
-
-        __asm__ ("sti" : : : "memory" );
-
-    }
-
-    // halts execution, dangerous if you dont know what you're doing (lols)
-    static inline void halt() {
-
-        __asm__ ("hlt");
-
-    }
-
-    // in bytes :D
-    static inline uint8_t in_byte(uint16_t port) {
-        uint8_t result;
-
-        __asm__ volatile ("inb %1, %0" : "=a"(result) : "Nd"(port));
-
-        return result;
-    }
-
-    // bytes out? :d
-    static inline void out_byte(uint16_t port, uint8_t value) {
-
-        __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port));
-      
-    }
 
 /// -# macro drivers
 
-    // FINALLY uart SINGLE CHARACTER output
-    static inline void uart_out_c(char character) {
+    // idt insertion thing
+    static void idt_append_function(uint8_t entry, void* function, uint8_t attributes, uint8_t ist_index, idt_entry_t idt[]) {
 
-        uint16_t port = 0x3F8;
-        uint16_t status_port = port + 5;
+        uint64_t pointer = (uint64_t)function;
 
-        // wait until its ready then do it
-        while ((in_byte(status_port) & 0b00010000) == 0) {}
+        idt[entry].isr_high = ((pointer >> 32) & 0xffffffff);
+        idt[entry].isr_mid = ((pointer >> 16) & 0xffff);
+        idt[entry].isr_low = (pointer & 0xffff);
 
-        out_byte(port, character);
-        
+        idt[entry].ist = ist_index;
+
+        idt[entry].attributes = attributes;
+
+        idt[entry].kernel_cs = 0x08;
+
+        idt[entry].reserved = 0;
 
     }
 
-    void uart_out_str(const char* str) {
+//// -~# KERNEL FUNCTIONS #~- ////
 
-        while (*str) {
+/// -# Interrupts and whatnot #- ///
 
-            uart_out_c(*str++);
+    // this handles panics ig
+    [[noreturn]] static void ctkn_panic_handle(uint16_t code) {
+
+        switch (code) {
+
+            // null pointer exception (scary)
+            case (0x0000):
+                
+                uart_out_str("[stage:unknown]:ctkn:error: CTKN_NULL_PTR_EXCEPTION, FATAL");
+
+                halt();
+            
+            // general protection fault (scarier)
+            case (0x0100): {
+
+                uart_out_str("[stage:unknown]:ctkn:error: CTKN_GENERAL_PROTECTION_FAULT, FATAL");
+
+                halt();
+
+            }
+
+            // fancy one incase my code didn't end up working because im a crackhead when it comes to writing this kernel lels \(-.-)/
+            case (0x0101): {
+
+                uart_out_str("[stage:unknown]:ctkn:error: CTKN_CRITICAL_PROTECTION_FAULT, CRITICAL FATAL");
+
+                halt();
+
+            }
+
+            // page fault (memory's mad, i couldn't possibly code something that could page fault im such a "good" dev ;D (trust))
+            case (0x0200): {
+
+                uart_out_str("[stage:unknown]:ctkn:error: CTKN_PAGE_FAULT, FATAL");
+
+                halt();
+
+            }
+
+            // testing one for good measure
+            case (0xFF00): {
+
+                uart_out_str("[stage:unknown]:ctkn:error: CTKN_FUNNY_TEST_PANIC_EXCEPTION, FATAL");
+
+                halt();
+
+            }
+
+        }
+
+        halt();
+
+    }
+
+    extern "C" {
+        
+        [[gnu::interrupt]] void ctkn_handle_null_expt(InterruptFrame* ptr) {
+
+            disable_interrupts();
+
+            ctkn_panic_handle(0x0000);
+            
+        }
+
+        [[gnu::interrupt]] void ctkn_handle_gp_flt(InterruptFrame* ptr, uint64_t nyi) {
+
+            disable_interrupts();
+
+            ctkn_panic_handle(0x0100);
+
+        }
+
+        [[gnu::interrupt]] void ctkn_handle_dp_flt(InterruptFrame* ptr, uint64_t nyi) {
+
+            disable_interrupts();
+
+            ctkn_panic_handle(0x101);
+
+        }
+
+        [[gnu::interrupt]] void ctkn_handle_page_flt(InterruptFrame* ptr, uint64_t nyi) {
+
+            disable_interrupts();
+
+            ctkn_panic_handle(0x0200);
+
+        }
+
+        [[gnu::interrupt]] void ctkn_handle_timer(InterruptFrame* ptr) {
+
+            disable_interrupts();
+
+            // no
 
         }
 
     }
-
-
-//// -~# KERNEL FUNCTIONS #~- ////
-
-
-// this handles panics ig
-[[noreturn]] static inline void ctkn_panic_handle(uint16_t code) {
-
-    switch (code) {
-
-        case (0x0000):
-            // null pointer exception woahh soo scary ahh
-            // nyi
-            halt();
-        
-        case (0x1000):
-            // random memory exception
-            // nyi
-            halt();
-
-    }
-
-    halt();
-
-}
 
 // this is the very evil very dangerous CTNU kernel starter wooah scary
 // inside lies the CTNU kernel which is very scary haha scary woooah ahhh
@@ -115,7 +191,7 @@ static inline void ctkn_kickstart_begin() {
 
         // nyi
 
-        ;
+        halt();
 
     }
 
@@ -133,30 +209,36 @@ static inline void ctkn_insert_begin() {
 
     disable_interrupts();
 
-    // tables yay (NO I HATE THIS I HATE TABLES SO MUCH I HATE IBM GOSH WHY THE HECK DOES IBM DO THIS CRAP I HATE CORNER CUTTING I WISH I COULD [[we will remove this from the public source available, --hex]])
-    
-    typedef struct {
-        uint16_t    isr_low;      // The lower 16 bits of the ISR's address
-        uint16_t    kernel_cs;    // The GDT segment selector that the CPU will load into CS before calling the ISR
-        uint8_t	    ist;          // The IST in the TSS that the CPU will load into RSP; set to zero for now
-        uint8_t     attributes;   // Type and attributes; see the IDT page
-        uint16_t    isr_mid;      // The higher 16 bits of the lower 32 bits of the ISR's address
-        uint32_t    isr_high;     // The higher 32 bits of the ISR's address
-        uint32_t    reserved;     // Set to zero
-    } __attribute__((packed)) idt_entry_t;
+    //
 
     __attribute__((aligned(0x10))) 
-    static idt_entry_t idt[256]; // Create an array of IDT entries, osdev wiki says alligning it like this is good for performance i think but i also dont think it really matters that much
+    idt_entry_t idt[256]; // Create an array of IDT entries, osdev wiki says alligning it like this is good for performance i think
 
-    typedef struct {
-        uint16_t	limit;
-        uint64_t	base;
-    } __attribute__((packed)) idtr_t;
+    for (uint16_t i = 256; i > 0; idt_append_function(--i, (void*)ctkn_handle_gp_flt, 0b10001110, 1, idt))
 
-    static idtr_t idtr;
+    idt_append_function(0, (void*)ctkn_handle_null_expt, 0b10001110, 1, idt);
+    idt_append_function(8, (void*)ctkn_handle_dp_flt, 0b10001110, 1, idt);
+    idt_append_function(14, (void*)ctkn_handle_page_flt, 0b10001110, 1, idt);
+
+    
 
 
-    enable_interrupts();
+
+    //
+
+    uint64_t GDT[7] = {0};
+
+    GDT[0] = 0x00; // null desc
+    GDT[1] = 0x00AF9A000000FFFF; // kernel code
+    GDT[2] = 0x00CF92000000FFFF; // kernel data
+    GDT[3] = 0x00CFF2000000FFFF; // user code
+    GDT[4] = 0x00AFA8000000FFFF; // user data
+    GDT[5] = (); // tss low
+    GDT[6] = (); // tss high
+
+    //
+
+    // enable_interrupts();
 
     ctkn_kickstart_begin();
 
@@ -166,7 +248,7 @@ static inline void ctkn_insert_begin() {
 //// -~# START #~- ////
 
 
-// this is where limine hooks in, which ive yet to exactly implement support completely for, though irc0.0 isn't done yet so who cares
+// this is where limine hooks in
 extern "C" {
     
     // this is SPECIFICALLY where limine hooks in
@@ -177,4 +259,3 @@ extern "C" {
     } 
 
 }
-// ALL RIGHTS RESERVED. dont run this on your hardware, there is no warranty provided for any damaged caused by the CTNU Project and anything in it.
